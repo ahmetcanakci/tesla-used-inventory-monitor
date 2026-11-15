@@ -7,63 +7,77 @@ from pathlib import Path
 
 import requests
 
-INVENTORY_URL = "https://www.tesla.com/coinorder/api/v4/inventory-results"
+# Public Tesla inventory search endpoint used by several community clients.
+INVENTORY_URL = "https://www.tesla.com/inventory/api/v4/inventory-results"
 STATE_FILE = Path("data/seen_vins.json")
 ZIP_CODE = os.getenv("TESLA_ZIP", "34080")
 
+
 def fetch_inventory():
-    payload = {
+    query = {
         "query": {
             "model": "my",
             "condition": "used",
             "options": {},
-            " arrangeby": "plh",
+            "arrangeby": "Price",
+            "order": "asc",
             "market": "TR",
             "language": "tr",
             "super_region": "europe",
             "zip": ZIP_CODE,
-            "range": 0
+            "range": 0,
+            "region": "TR",
         },
-        "queryでは": None
+        "offset": 0,
+        "count": 50,
+        "outsideOffset": 0,
+        "outsideSearch": False,
+        "isFalconDeliverySelectionEnabled": False,
+        "version": None,
     }
-    # Tesla's inventory endpoint is undocumented and may change.
-    # Keep request headers browser-like; inspect Actions logs if Tesla changes it.
-    response = requests.post(
+
+    response = requests.get(
         INVENTORY_URL,
-        params={"query": json.dumps(payload["query"], separators=(",", ":"))},
+        params={"query": json.dumps(query, separators=(",", ":"))},
         headers={
-            "User-Agent": "Mozilla/5.0",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
             "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+            "Referer": (
+                "https://www.tesla.com/tr_TR/inventory/used/my"
+                "?arrangeby=plh&zip=34080&HasVehiclePhotos=true"
+            ),
             "Origin": "https://www.tesla.com",
-            "Referer": "https://www.tesla.com/tr_TR/inventory/used/my"
         },
         timeout=30,
     )
     response.raise_for_status()
     data = response.json()
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        raise RuntimeError("Tesla API beklenmeyen yanıt döndürdü; envanter güvenilir şekilde okunamadı.")
     return extract_vehicles(data)
+
 
 def extract_vehicles(data):
     vehicles = []
-    def walk(obj):
-        if isinstance(obj, dict):
-            if obj.get("VIN") or obj.get("vin"):
-                vin = obj.get("VIN") or obj.get("vin")
-                vehicles.append({
-                    "vin": vin,
-                    "model": obj.get("TrimName") or obj.get("Model") or "Model Y",
-                    "price": obj.get("Price") or obj.get("TotalPrice"),
-                    "year": obj.get("Year"),
-                    "url": obj.get("ModelCode") or ""
-                })
-            for value in obj.values():
-                walk(value)
-        elif isinstance(obj, list):
-            for value in obj:
-                walk(value)
-    walk(data)
-    unique = {v["vin"]: v for v in vehicles}
+    for obj in data.get("results", []):
+        vin = obj.get("VIN") or obj.get("vin")
+        if not vin:
+            continue
+        vehicles.append({
+            "vin": vin,
+            "model": obj.get("TrimName") or obj.get("Model") or "Model Y",
+            "price": obj.get("InventoryPrice") or obj.get("Price") or obj.get("TotalPrice"),
+            "year": obj.get("Year"),
+            "url": f"https://www.tesla.com/tr_TR/my/order/{vin}",
+        })
+    unique = {vehicle["vin"]: vehicle for vehicle in vehicles}
     return list(unique.values())
+
 
 def send_email(new_vehicles):
     sender = os.environ["GMAIL_ADDRESS"]
@@ -76,7 +90,12 @@ def send_email(new_vehicles):
             f"VIN: {vehicle['vin']} | Model: {vehicle['model']} | "
             f"Yıl: {vehicle['year'] or '-'} | Fiyat: {vehicle['price'] or '-'}"
         )
-    lines += ["", "Envanter sayfası:", "https://www.tesla.com/tr_TR/inventory/used/my?arrangeby=plh&zip=34080&HasVehiclePhotos=true"]
+        lines.append(vehicle["url"])
+        lines.append("")
+    lines += [
+        "Envanter sayfası:",
+        "https://www.tesla.com/tr_TR/inventory/used/my?arrangeby=plh&zip=34080&HasVehiclePhotos=true",
+    ]
 
     message = EmailMessage()
     message["Subject"] = f"Tesla ikinci el Model Y: {len(new_vehicles)} yeni ilan"
@@ -88,6 +107,7 @@ def send_email(new_vehicles):
         smtp.login(sender, password)
         smtp.send_message(message)
 
+
 def main():
     vehicles = fetch_inventory()
     print(f"API'den bulunan VIN sayısı: {len(vehicles)}")
@@ -98,20 +118,24 @@ def main():
     else:
         seen = set()
 
-    current = {v["vin"] for v in vehicles}
+    current = {vehicle["vin"] for vehicle in vehicles}
     new_vins = current - seen
 
-    # First run establishes a baseline; it does not email all existing listings.
+    # First successful run establishes a baseline; it does not email existing listings.
     if not STATE_FILE.exists():
-        print("İlk çalışma: mevcut ilanlar başlangıç listesi olarak kaydedildi; e-posta gönderilmedi.")
+        print("İlk başarılı çalışma: mevcut ilanlar başlangıç listesine kaydedilecek; e-posta gönderilmeyecek.")
     elif new_vins:
-        new_vehicles = [v for v in vehicles if v["vin"] in new_vins]
+        new_vehicles = [vehicle for vehicle in vehicles if vehicle["vin"] in new_vins]
         send_email(new_vehicles)
         print(f"{len(new_vehicles)} yeni ilan için e-posta gönderildi.")
     else:
         print("Yeni ilan yok.")
 
-    STATE_FILE.write_text(json.dumps(sorted(seen | current), ensure_ascii=False, indent=2), encoding="utf-8")
+    STATE_FILE.write_text(
+        json.dumps(sorted(seen | current), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
 
 if __name__ == "__main__":
     try:
