@@ -4,73 +4,75 @@ import smtplib
 import sys
 from email.message import EmailMessage
 from pathlib import Path
-from urllib.parse import quote
 
 from selenium import webdriver
 from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
 
-INVENTORY_URL = "https://www.tesla.com/inventory/api/v4/inventory-results"
+INVENTORY_PAGE_URL = "https://www.tesla.com/tr_TR/inventory/used/my?arrangeby=plh&zip=34080&range=0"
 STATE_FILE = Path("data/seen_vins.json")
-ZIP_CODE = os.getenv("TESLA_ZIP", "34080")
-
-
-def build_query_url():
-    query = {
-        "query": {
-            "model": "my",
-            "condition": "used",
-            "options": {},
-            "arrangeby": "Price",
-            "order": "asc",
-            "market": "TR",
-            "language": "tr",
-            "super_region": "europe",
-            "zip": ZIP_CODE,
-            "range": 0,
-            "region": "TR",
-        },
-        "offset": 0,
-        "count": 50,
-        "outsideOffset": 0,
-        "outsideSearch": False,
-        "isFalconDeliverySelectionEnabled": False,
-        "version": None,
-    }
-    return INVENTORY_URL + "?query=" + quote(json.dumps(query, separators=(",", ":")))
 
 
 def fetch_inventory():
-    # Open the API URL in a normal headless Chrome session rather than requests.
-    # This does not bypass Tesla's access controls; if Tesla presents an access
-    # denial/challenge page, fail safely and do not update the VIN state.
+    # Önce kullanıcının verdiği resmi envanter sayfasını aç.
+    # Sayfa başarılı yüklenirse, sayfanın kendi oturumunda yüklediği envanter
+    # JSON kaynağını bulup aynı tarayıcı bağlamında okur.
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1440,1200")
     options.add_argument("--lang=tr-TR")
+    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
     driver = None
     try:
         driver = webdriver.Chrome(options=options)
-        driver.set_page_load_timeout(45)
-        driver.get(build_query_url())
-        body = driver.find_element(By.TAG_NAME, "body").text.strip()
-        if not body:
-            raise RuntimeError("Chrome boş yanıt aldı; Tesla API yanıtı okunamadı.")
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            title = driver.title or "başlıksız sayfa"
-            excerpt = body[:250].replace("\\n", " ")
+        driver.set_page_load_timeout(60)
+        driver.get(INVENTORY_PAGE_URL)
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+
+        # Sayfanın ağ kayıtlarında envanter API isteğini ara.
+        resources = driver.execute_script("""
+            return performance.getEntriesByType('resource')
+                .map(e => e.name)
+                .filter(u => u.includes('/inventory/api/') && u.includes('inventory-results'));
+        """)
+        api_url = resources[-1] if resources else None
+
+        if not api_url:
+            # Bazı tarayıcı/yanıt durumlarında performans kaydı bulunmayabilir.
+            body = driver.find_element(By.TAG_NAME, "body").text.strip()
+            excerpt = body[:400].replace("\\n", " ")
             raise RuntimeError(
-                f"Tesla JSON yerine HTML/metin döndürdü (sayfa: {title}). "
-                f"Yanıt başlangıcı: {excerpt}"
+                "Envanter sayfası açıldı ancak sayfanın yüklediği inventory-results "
+                f"JSON isteği bulunamadı. Sayfa metni: {excerpt}"
             )
+
+        result = driver.execute_async_script("""
+            const url = arguments[0];
+            const done = arguments[arguments.length - 1];
+            fetch(url, { credentials: 'include' })
+                .then(r => {
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return r.json();
+                })
+                .then(data => done({ok: true, data}))
+                .catch(err => done({ok: false, error: String(err)}));
+        """, api_url)
+
+        if not result or not result.get("ok"):
+            raise RuntimeError(
+                "Tesla envanter JSON'u sayfa oturumundan okunamadı: "
+                + str((result or {}).get("error", "bilinmeyen hata"))
+            )
+        data = result["data"]
         if not isinstance(data, dict) or not isinstance(data.get("results"), list):
-            raise RuntimeError("Tesla API yanıtında beklenen results listesi yok.")
-        print(f"Chrome ile Tesla API yanıtı alındı; toplam eşleşme: {data.get('total_matches_found', 'bilinmiyor')}")
+            raise RuntimeError("Tesla yanıtında beklenen results listesi yok.")
+        print(f"Envanter sayfasından JSON alındı; toplam eşleşme: {data.get('total_matches_found', 'bilinmiyor')}")
         return extract_vehicles(data)
     except WebDriverException as exc:
         raise RuntimeError(f"Chrome/Selenium hatası: {exc}") from exc
@@ -106,10 +108,7 @@ def send_email(new_vehicles):
             f"Yıl: {vehicle['year'] or '-'} | Fiyat: {vehicle['price'] or '-'}"
         )
         lines.extend([vehicle["url"], ""])
-    lines.extend([
-        "Envanter sayfası:",
-        "https://www.tesla.com/tr_TR/inventory/used/my?arrangeby=plh&zip=34080&HasVehiclePhotos=true",
-    ])
+    lines.extend(["Envanter sayfası:", INVENTORY_PAGE_URL])
     message = EmailMessage()
     message["Subject"] = f"Tesla ikinci el Model Y: {len(new_vehicles)} yeni ilan"
     message["From"] = sender
