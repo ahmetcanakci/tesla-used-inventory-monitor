@@ -4,16 +4,19 @@ import smtplib
 import sys
 from email.message import EmailMessage
 from pathlib import Path
+from urllib.parse import quote
 
-import requests
+from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
 
-# Public Tesla inventory search endpoint used by several community clients.
 INVENTORY_URL = "https://www.tesla.com/inventory/api/v4/inventory-results"
 STATE_FILE = Path("data/seen_vins.json")
 ZIP_CODE = os.getenv("TESLA_ZIP", "34080")
 
 
-def fetch_inventory():
+def build_query_url():
     query = {
         "query": {
             "model": "my",
@@ -35,31 +38,45 @@ def fetch_inventory():
         "isFalconDeliverySelectionEnabled": False,
         "version": None,
     }
+    return INVENTORY_URL + "?query=" + quote(json.dumps(query, separators=(",", ":")))
 
-    response = requests.get(
-        INVENTORY_URL,
-        params={"query": json.dumps(query, separators=(",", ":"))},
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
-            "Referer": (
-                "https://www.tesla.com/tr_TR/inventory/used/my"
-                "?arrangeby=plh&zip=34080&HasVehiclePhotos=true"
-            ),
-            "Origin": "https://www.tesla.com",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
-    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
-        raise RuntimeError("Tesla API beklenmeyen yanıt döndürdü; envanter güvenilir şekilde okunamadı.")
-    return extract_vehicles(data)
+
+def fetch_inventory():
+    # Open the API URL in a normal headless Chrome session rather than requests.
+    # This does not bypass Tesla's access controls; if Tesla presents an access
+    # denial/challenge page, fail safely and do not update the VIN state.
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1440,1200")
+    options.add_argument("--lang=tr-TR")
+    driver = None
+    try:
+        driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(45)
+        driver.get(build_query_url())
+        body = driver.find_element(By.TAG_NAME, "body").text.strip()
+        if not body:
+            raise RuntimeError("Chrome boş yanıt aldı; Tesla API yanıtı okunamadı.")
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            title = driver.title or "başlıksız sayfa"
+            excerpt = body[:250].replace("\\n", " ")
+            raise RuntimeError(
+                f"Tesla JSON yerine HTML/metin döndürdü (sayfa: {title}). "
+                f"Yanıt başlangıcı: {excerpt}"
+            )
+        if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+            raise RuntimeError("Tesla API yanıtında beklenen results listesi yok.")
+        print(f"Chrome ile Tesla API yanıtı alındı; toplam eşleşme: {data.get('total_matches_found', 'bilinmiyor')}")
+        return extract_vehicles(data)
+    except WebDriverException as exc:
+        raise RuntimeError(f"Chrome/Selenium hatası: {exc}") from exc
+    finally:
+        if driver:
+            driver.quit()
 
 
 def extract_vehicles(data):
@@ -75,34 +92,29 @@ def extract_vehicles(data):
             "year": obj.get("Year"),
             "url": f"https://www.tesla.com/tr_TR/my/order/{vin}",
         })
-    unique = {vehicle["vin"]: vehicle for vehicle in vehicles}
-    return list(unique.values())
+    return list({v["vin"]: v for v in vehicles}.values())
 
 
 def send_email(new_vehicles):
     sender = os.environ["GMAIL_ADDRESS"]
     password = os.environ["GMAIL_APP_PASSWORD"]
     recipient = os.getenv("MAIL_TO", sender)
-
     lines = ["Tesla Türkiye ikinci el Model Y envanterinde yeni araç bulundu:", ""]
     for vehicle in new_vehicles:
         lines.append(
             f"VIN: {vehicle['vin']} | Model: {vehicle['model']} | "
             f"Yıl: {vehicle['year'] or '-'} | Fiyat: {vehicle['price'] or '-'}"
         )
-        lines.append(vehicle["url"])
-        lines.append("")
-    lines += [
+        lines.extend([vehicle["url"], ""])
+    lines.extend([
         "Envanter sayfası:",
         "https://www.tesla.com/tr_TR/inventory/used/my?arrangeby=plh&zip=34080&HasVehiclePhotos=true",
-    ]
-
+    ])
     message = EmailMessage()
     message["Subject"] = f"Tesla ikinci el Model Y: {len(new_vehicles)} yeni ilan"
     message["From"] = sender
     message["To"] = recipient
-    message.set_content("\n".join(lines))
-
+    message.set_content("\\n".join(lines))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
         smtp.login(sender, password)
         smtp.send_message(message)
@@ -110,27 +122,21 @@ def send_email(new_vehicles):
 
 def main():
     vehicles = fetch_inventory()
-    print(f"API'den bulunan VIN sayısı: {len(vehicles)}")
-
+    print(f"Envanterde bulunan VIN sayısı: {len(vehicles)}")
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     if STATE_FILE.exists():
         seen = set(json.loads(STATE_FILE.read_text(encoding="utf-8")))
     else:
         seen = set()
-
-    current = {vehicle["vin"] for vehicle in vehicles}
+    current = {v["vin"] for v in vehicles}
     new_vins = current - seen
-
-    # First successful run establishes a baseline; it does not email existing listings.
     if not STATE_FILE.exists():
-        print("İlk başarılı çalışma: mevcut ilanlar başlangıç listesine kaydedilecek; e-posta gönderilmeyecek.")
+        print("İlk başarılı tarama: mevcut ilanlar başlangıç listesine kaydedilecek; e-posta gönderilmeyecek.")
     elif new_vins:
-        new_vehicles = [vehicle for vehicle in vehicles if vehicle["vin"] in new_vins]
-        send_email(new_vehicles)
-        print(f"{len(new_vehicles)} yeni ilan için e-posta gönderildi.")
+        send_email([v for v in vehicles if v["vin"] in new_vins])
+        print(f"{len(new_vins)} yeni ilan için e-posta gönderildi.")
     else:
         print("Yeni ilan yok.")
-
     STATE_FILE.write_text(
         json.dumps(sorted(seen | current), ensure_ascii=False, indent=2),
         encoding="utf-8",
